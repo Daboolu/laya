@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build ARM64 CUDA 13.0 image
         run: docker build --pull --build-arg TORCH_INDEX=cu130 -t laya:spark .
       - name: Check CUDA libraries and dependencies without a GPU
@@ -45,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate Compose and build CPU image
         run: |
           docker compose -f compose.yaml -f compose.spark.yaml config --quiet
@@ -116,7 +116,7 @@ jobs:
       LAYA_PRELOAD: "0"
       LAYA_API_KEY: ci-test-key
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Start laya-serve and wait until healthy
         run: docker compose up --build -d --wait --wait-timeout 300 laya-serve
       - name: Check binding, health and bearer auth
