@@ -45,6 +45,118 @@ result = router.predict(
 print(result["answers"])
 ```
 
+## 输入模板
+
+`Router.predict(state, questions)` 接收两个必填参数：
+
+- `state`：待分析内容，可以是字符串、字典或列表；字典和列表会先序列化为 JSON。
+- `questions`：问题字典。一次可以提交多个问题，每个问题的键也是输出中的答案键。
+
+完整模板如下。`type`、`instructions`、`criteria`、`labels` 以及 `choice`、`score`、`noul` 是固定协议字段，不能翻译；问题名称、说明、候选标签和业务数据可以使用中文。
+
+```python
+state = {
+    "任意业务字段": "需要模型判断的内容",
+}
+
+questions = {
+    "分类问题名称": {
+        "type": "choice",
+        "instructions": "需要从候选项中判断什么？",
+        "criteria": {
+            "候选标签一": "候选项的含义",
+            "候选标签二": "候选项的含义",
+        },
+    },
+    "评分问题名称": {
+        "type": "score",
+        "instructions": "需要按什么标准评分？",
+        "criteria": ["最低等级", "中间等级", "最高等级"],
+    },
+    "真假问题名称": {
+        "type": "noul",
+        "instructions": "需要判断真假的陈述？",
+        # criteria 可省略；如需补充语义，只能使用 false 和 true 两个键。
+        "criteria": {
+            "false": "不成立时的含义",
+            "true": "成立时的含义",
+        },
+        # labels 可省略；它只改变送给模型的两个标签，不改变 noul=P(true)。
+        "labels": {"false": "B", "true": "A"},
+    },
+}
+
+result = router.predict(state, questions)
+```
+
+三种问题类型：
+
+| `type` | `criteria` | 输出 |
+|---|---|---|
+| `choice` | 非空字典：`标签 -> 描述` | 概率最高的标签及所有候选概率 |
+| `score` | 按低到高排列的非空列表 | 等级编号的概率加权平均值及各等级概率 |
+| `noul` | 可省略，或提供 `false`/`true` 描述 | `true` 的概率，即 `P(true)` |
+
+## 输出模板
+
+返回值是可以直接 JSON 序列化的字典。下面同时展示三种答案的结构，数值仅作示意：
+
+```json
+{
+  "model": "laya-rl-agent",
+  "answers": {
+    "分类问题名称": {
+      "type": "choice",
+      "answer_confidence": 0.90,
+      "action": {"act_probability": 1.0},
+      "choice": "候选标签一",
+      "probabilities": {
+        "候选标签一": 0.90,
+        "候选标签二": 0.10
+      },
+      "confidence": 0.53
+    },
+    "评分问题名称": {
+      "type": "score",
+      "answer_confidence": 0.85,
+      "action": {"act_probability": 1.0},
+      "score": 1.8,
+      "probabilities": {"0": 0.05, "1": 0.10, "2": 0.85},
+      "confidence": 0.53
+    },
+    "真假问题名称": {
+      "type": "noul",
+      "answer_confidence": 0.85,
+      "action": {"act_probability": 1.0},
+      "noul": 0.85,
+      "confidence": 0.85
+    }
+  },
+  "usage": {
+    "input_tokens": 123,
+    "output_tokens": 0
+  },
+  "routing": {
+    "model": "multilingual",
+    "repo": "convaiinnovations/laya/multilingual",
+    "reason": "检测到非拉丁文字：han",
+    "detection": {}
+  }
+}
+```
+
+关键输出字段：
+
+- `choice`：`choice` 问题最终选择的标签。
+- `score`：等级下标的期望值。例如等级 `0、1、2` 的概率分别为 `0.05、0.10、0.85`，则结果为 `0×0.05 + 1×0.10 + 2×0.85 = 1.8`。
+- `noul`：`true` 的概率。可用 `result["answers"][问题名]["noul"] >= 0.5` 转成布尔值。
+- `probabilities`：所有候选项的概率，合计约为 1。
+- `answer_confidence`：概率最高候选项的概率。对 `noul` 而言，如果 `noul < 0.5`，它等于 `1 - noul`。
+- `confidence`：`choice` 和 `score` 使用归一化熵表示分布集中程度；`noul` 当前与 `answer_confidence` 相同。这不是准确率保证。
+- `action.act_probability`：独立动作头输出，现有 checkpoint 上暂不适合作为可靠阈值。
+- `usage.input_tokens`：该批问题实际送入模型的 token 总数；模型不生成文本，因此 `output_tokens` 为 0。
+- `routing`：自动选择的 checkpoint 以及语言检测依据。显式指定 `model` 或 `lang` 时，`detection` 可以是 `null`。
+
 内置 checkpoint：
 
 | 名称 | 编码器 | 参数量 | 用途 | 默认最大上下文 |
@@ -57,7 +169,7 @@ print(result["answers"])
 
 ## 模型架构
 
-Laya 是非自回归的判别模型，不是生成式语言模型。一次调用中的多个问题组成一个 batch，只执行一次模型前向计算：
+Laya 本质上是 Encoder-only Transformer：它是非自回归的判别模型，不是生成式语言模型。一次调用中的多个问题组成一个 batch，只执行一次模型前向计算：
 
 ```text
 状态 + 类型化问题 + 候选项
@@ -88,6 +200,20 @@ Laya 是非自回归的判别模型，不是生成式语言模型。一次调用
 
 `act_probability` 来自独立动作头。上游现有评测认为它暂时没有可靠的筛选能力，不应把 `1.0` 理解为答案百分之百正确。
 
+### 模型实际接收的张量
+
+API 中的一份 `state` 配多个 `questions`。预处理时，每个问题会单独与同一份 `state` 拼成一条序列；这些序列再组成一个 batch。因此，一次 `predict()` 可以在一次前向计算中回答多个问题，但每个问题都有自己的候选项位置。
+
+```text
+input_ids       [问题数, 序列长度]       编码后的问题、候选项和状态
+attention_mask  [问题数, 序列长度]       区分真实 token 与 padding
+marker_pos      [问题数, 最大候选数]     每个候选项前 [MASK] 的位置
+marker_mask     [问题数, 最大候选数]     区分真实候选项与 padding
+question_type   [问题数]                 choice=0、score=1、noul=2
+```
+
+模型读取 `marker_pos` 指向的隐藏状态，为每个候选项产生一个 logit。训练时还会加入与候选项一一对应的 `target` 概率分布；推理时不需要标签。
+
 ## 模型下载与加载
 
 `Router` 默认延迟加载模型：`predict()` 先检测输入语言，中文等非英语文本选择 `multilingual`，英文选择 `english`。首次使用时，`huggingface_hub.snapshot_download()` 从 [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) 下载当前 checkpoint 所需文件：
@@ -105,6 +231,84 @@ tokenizer/tokenizer_config.json
 ## 训练方式
 
 本精简分支只保留推理代码，不包含训练脚本。下面描述的是上游公开的训练方法和[可复现微调 notebook](https://github.com/NandhaKishorM/laya/blob/main/notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb)；公开基础 checkpoint 的完整原始数据配方没有包含在本分支中。
+
+### 训练数据格式
+
+逻辑上一条训练案例包含 `state`、`questions` 和对应的标准答案 `gold`。下面同时包含三种问题类型：
+
+```json
+{
+  "id": "case-0001",
+  "state": {
+    "客户消息": "我被重复扣费了，请尽快退款。"
+  },
+  "questions": {
+    "处理部门": {
+      "type": "choice",
+      "instructions": "应该由哪个部门处理？",
+      "criteria": {
+        "账单部门": "处理付款和退款",
+        "技术部门": "处理程序和系统故障"
+      }
+    },
+    "紧急程度": {
+      "type": "score",
+      "instructions": "这个请求有多紧急？",
+      "criteria": ["不紧急", "普通", "紧急"]
+    },
+    "是否要求退款": {
+      "type": "noul",
+      "instructions": "客户是否明确要求退款？"
+    }
+  },
+  "gold": {
+    "处理部门": {
+      "type": "choice",
+      "label": "账单部门",
+      "probabilities": {
+        "账单部门": 1.0,
+        "技术部门": 0.0
+      }
+    },
+    "紧急程度": {
+      "type": "score",
+      "label": "2",
+      "score": 2.0,
+      "probabilities": {
+        "0": 0.0,
+        "1": 0.0,
+        "2": 1.0
+      }
+    },
+    "是否要求退款": {
+      "type": "noul",
+      "label": "true",
+      "noul": 1.0,
+      "probabilities": {
+        "false": 0.0,
+        "true": 1.0
+      }
+    }
+  }
+}
+```
+
+训练数据约束：
+
+- `gold` 的键必须与 `questions` 的键对应。
+- `choice.probabilities` 的键必须与 `criteria` 的候选标签一致。
+- `score.probabilities` 使用从 `"0"` 开始的字符串下标，对应 `criteria` 中从低到高的等级。
+- `noul.probabilities` 固定使用 `false` 和 `true`，其中 `noul` 就是 `P(true)`。
+- 概率应非负且总和为 1。只有硬标签时可以使用 one-hot；多个标注者或教师模型给出不确定答案时可以保留软分布，例如 `0.7/0.3`。
+- 上游 [`LocalLLaMA/typed-decisions`](https://huggingface.co/datasets/LocalLLaMA/typed-decisions) 数据集把 `state`、`questions`、`gold` 存为 JSON 字符串，notebook 读取后会执行 `json.loads()`；如果自行编写数据加载器，也可以直接存为 JSON 对象。
+
+预处理会把一条案例拆成“每个问题一条训练序列”。上例产生 3 条序列；它们共享同一个 `state`，但分别拥有自己的 `question_type`、候选项位置和目标分布：
+
+```text
+choice target = [1.0, 0.0]
+score  target = [0.0, 0.0, 1.0]
+noul   target = [0.0, 1.0]  # 固定顺序：[false, true]
+```
 
 上游把这种方法称为 RLCD：使用严格适当评分规则作为奖励，并采用 GRPO 风格策略梯度训练。
 
